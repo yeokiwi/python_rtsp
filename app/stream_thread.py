@@ -11,8 +11,14 @@ class StreamThread(QThread):
     status_changed = pyqtSignal(str)  # "connecting", "connected", "disconnected", "error"
     error_occurred = pyqtSignal(str)
 
+    # Short timeout (in microseconds) so cap.open/read don't block for 30s
+    _OPEN_TIMEOUT_US = 5_000_000   # 5 seconds
+    _READ_TIMEOUT_US = 5_000_000   # 5 seconds
+
     def __init__(self, url, name="Stream", parent=None):
-        super().__init__(parent)
+        # Do NOT parent to a widget — prevents "destroyed while running" when
+        # the parent widget is deleted before the thread finishes.
+        super().__init__(None)
         self.url = url
         self.name = name
         self._running = False
@@ -23,10 +29,16 @@ class StreamThread(QThread):
 
         while self._running:
             self.status_changed.emit("connecting")
-            cap = cv2.VideoCapture(self.url, cv2.CAP_FFMPEG)
 
-            # Set buffer size to reduce latency
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            cap = cv2.VideoCapture(
+                self.url,
+                cv2.CAP_FFMPEG,
+                [
+                    cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, self._OPEN_TIMEOUT_US // 1000,
+                    cv2.CAP_PROP_READ_TIMEOUT_MSEC, self._READ_TIMEOUT_US // 1000,
+                    cv2.CAP_PROP_BUFFERSIZE, 1,
+                ],
+            )
 
             if not cap.isOpened():
                 self.status_changed.emit("error")
@@ -63,4 +75,8 @@ class StreamThread(QThread):
     def stop(self):
         """Signal the thread to stop and wait for it to finish."""
         self._running = False
-        self.wait(5000)  # Wait up to 5 seconds
+        # Wait long enough for the OpenCV timeout + some margin
+        if not self.wait(8000):
+            # Thread still running — force terminate as last resort
+            self.terminate()
+            self.wait(2000)

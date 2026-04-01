@@ -74,7 +74,7 @@ class StreamWidget(QWidget):
         if self._thread is not None:
             self.stop()
 
-        self._thread = StreamThread(self.url, self.name, parent=self)
+        self._thread = StreamThread(self.url, self.name)
         self._thread.frame_received.connect(self._on_frame)
         self._thread.status_changed.connect(self._on_status_changed)
         self._thread.start()

@@ -195,19 +195,34 @@ class MainWindow(QMainWindow):
 
     def _rebuild_grid(self):
         """Rearrange all stream widgets in the grid layout."""
-        # Remove all widgets from grid
+        # Remove all widgets from grid without changing parent
         while self.grid_layout.count():
             item = self.grid_layout.takeAt(0)
-            if item.widget():
-                item.widget().setParent(None)
+            w = item.widget()
+            if w:
+                w.hide()
+
+        # Reset stretch factors so all rows/columns share space equally
+        for i in range(self.grid_layout.rowCount()):
+            self.grid_layout.setRowStretch(i, 0)
+        for i in range(self.grid_layout.columnCount()):
+            self.grid_layout.setColumnStretch(i, 0)
 
         # Add widgets back in grid order
         cols = self._grid_columns
+        rows_needed = (len(self.stream_widgets) + cols - 1) // cols if self.stream_widgets else 0
         for i, widget in enumerate(self.stream_widgets):
             row = i // cols
             col = i % cols
             self.grid_layout.addWidget(widget, row, col)
+            widget.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
             widget.show()
+
+        # Set equal stretch for all active rows and columns
+        for r in range(rows_needed):
+            self.grid_layout.setRowStretch(r, 1)
+        for c in range(cols):
+            self.grid_layout.setColumnStretch(c, 1)
 
         self._update_status()
 
@@ -272,7 +287,11 @@ class MainWindow(QMainWindow):
         )
         if reply == QMessageBox.StandardButton.Yes:
             widget = self.stream_widgets.pop(index)
+            # Stop stream and disconnect signals before removing from layout
             widget.stop()
+            self.grid_layout.removeWidget(widget)
+            widget.hide()
+            widget.setParent(None)
             widget.deleteLater()
             self.config_manager.remove_stream(index)
             self._rebuild_grid()

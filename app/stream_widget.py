@@ -85,6 +85,12 @@ class StreamWidget(QWidget):
             self.stop_recording()
 
         if self._thread is not None:
+            # Disconnect signals first to prevent callbacks on a stopping/deleted widget
+            try:
+                self._thread.frame_received.disconnect(self._on_frame)
+                self._thread.status_changed.disconnect(self._on_status_changed)
+            except (TypeError, RuntimeError):
+                pass
             self._thread.stop()
             self._thread = None
 
@@ -112,10 +118,11 @@ class StreamWidget(QWidget):
         bytes_per_line = ch * w
         q_img = QImage(rgb.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
 
-        # Scale to widget size while maintaining aspect ratio
+        # Scale to widget size — all streams display at the same cell size
         label_size = self.video_label.size()
         pixmap = QPixmap.fromImage(q_img).scaled(
-            label_size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
+            label_size, Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.FastTransformation
         )
 
         # Draw overlays

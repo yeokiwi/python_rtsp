@@ -29,6 +29,11 @@ class StreamWidget(QWidget):
         self._frame_size = None
         self._fps = 20.0
 
+        self._detection_thread = None
+        self._last_detections = []
+        self._det_frame_w = 0
+        self._det_frame_h = 0
+
         self._setup_ui()
 
     def _setup_ui(self):
@@ -79,8 +84,35 @@ class StreamWidget(QWidget):
         self._thread.status_changed.connect(self._on_status_changed)
         self._thread.start()
 
+    def set_detector(self, detector):
+        """Attach a YOLOv9Detector and start the per-stream detection thread."""
+        self.clear_detector()
+        from app.detection_thread import DetectionThread
+        self._detection_thread = DetectionThread(detector)
+        self._detection_thread.detections_ready.connect(self._on_detections)
+        self._detection_thread.start()
+
+    def clear_detector(self):
+        """Stop the detection thread and discard any cached results."""
+        if self._detection_thread is not None:
+            try:
+                self._detection_thread.detections_ready.disconnect(self._on_detections)
+            except (TypeError, RuntimeError):
+                pass
+            self._detection_thread.stop()
+            self._detection_thread = None
+        self._last_detections = []
+
+    def _on_detections(self, detections, fw, fh):
+        """Receive detection results from the detection thread."""
+        self._last_detections = detections
+        self._det_frame_w = fw
+        self._det_frame_h = fh
+
     def stop(self):
         """Stop the stream and any active recording."""
+        self.clear_detector()
+
         if self._recorder.is_recording:
             self.stop_recording()
 
@@ -107,6 +139,10 @@ class StreamWidget(QWidget):
         # Estimate FPS from capture if possible
         if self._thread and hasattr(self._thread, "_cap_fps"):
             self._fps = self._thread._cap_fps or 20.0
+
+        # Submit to detection thread if active (non-blocking; drops if busy)
+        if self._detection_thread is not None:
+            self._detection_thread.submit_frame(frame, w, h)
 
         # Record frame if recording
         if self._recorder.is_recording:
@@ -152,11 +188,31 @@ class StreamWidget(QWidget):
             painter.setPen(QColor(255, 255, 255))
             painter.drawText(pixmap.width() - 60, 17, "REC")
 
+        # Detection bounding boxes
+        if self._last_detections and self._det_frame_w > 0:
+            scale_x = pixmap.width() / self._det_frame_w
+            scale_y = pixmap.height() / self._det_frame_h
+            det_font = QFont("Arial", 8)
+            painter.setFont(det_font)
+            for x1, y1, x2, y2, conf, name in self._last_detections:
+                bx1 = int(x1 * scale_x)
+                by1 = int(y1 * scale_y)
+                bx2 = int(x2 * scale_x)
+                by2 = int(y2 * scale_y)
+                painter.setPen(QColor(0, 255, 0))
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawRect(bx1, by1, bx2 - bx1, by2 - by1)
+                label = f"{name} {conf:.2f}"
+                painter.fillRect(bx1, by1 - 13, len(label) * 6 + 4, 13, QColor(0, 0, 0, 160))
+                painter.setPen(QColor(0, 255, 0))
+                painter.drawText(bx1 + 2, by1 - 2, label)
+
         painter.end()
 
     def _on_status_changed(self, status):
         self._status = status
         if status != "connected":
+            self._last_detections = []
             self._update_placeholder()
 
     def start_recording(self):
@@ -207,6 +263,16 @@ class StreamWidget(QWidget):
         snapshot = QAction("Take Snapshot", self)
         snapshot.triggered.connect(lambda: self.take_snapshot())
         menu.addAction(snapshot)
+
+        menu.addSeparator()
+
+        if self._detection_thread is not None:
+            det_action = QAction("Disable Detection", self)
+            det_action.triggered.connect(self.clear_detector)
+        else:
+            det_action = QAction("Enable Detection", self)
+            det_action.setEnabled(False)  # must be enabled globally first
+        menu.addAction(det_action)
 
         menu.addSeparator()
 

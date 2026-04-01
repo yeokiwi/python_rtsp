@@ -33,6 +33,12 @@ class MainWindow(QMainWindow):
         self._fullscreen_widget = None
         self._grid_columns = config_manager.get_grid_columns()
 
+        self._detector = None
+        self._detection_enabled = False
+        self._model_path = "yolov9c.pt"
+        self._conf_threshold = 0.25
+        self._det_device = None  # auto-select
+
         self._setup_window()
         self._setup_menus()
         self._setup_toolbar()
@@ -122,6 +128,22 @@ class MainWindow(QMainWindow):
         open_rec_dir.triggered.connect(self._open_recordings_folder)
         rec_menu.addAction(open_rec_dir)
 
+        # Detection menu
+        det_menu = menubar.addMenu("&Detection")
+
+        self._det_toggle_action = QAction("&Enable Detection", self)
+        self._det_toggle_action.setCheckable(True)
+        self._det_toggle_action.triggered.connect(self._toggle_detection)
+        det_menu.addAction(self._det_toggle_action)
+
+        load_model_action = QAction("&Load Model...", self)
+        load_model_action.triggered.connect(self._load_model)
+        det_menu.addAction(load_model_action)
+
+        det_settings_action = QAction("Detection &Settings...", self)
+        det_settings_action.triggered.connect(self._show_detection_settings)
+        det_menu.addAction(det_settings_action)
+
         # View menu
         view_menu = menubar.addMenu("&View")
 
@@ -159,6 +181,12 @@ class MainWindow(QMainWindow):
         stop_rec_btn.triggered.connect(self._stop_all_recording)
         toolbar.addAction(stop_rec_btn)
 
+        toolbar.addSeparator()
+
+        self._det_btn = QAction("Detection OFF", self)
+        self._det_btn.triggered.connect(self._toggle_detection)
+        toolbar.addAction(self._det_btn)
+
     def _setup_central_widget(self):
         self.central_widget = QWidget()
         self.setCentralWidget(self.central_widget)
@@ -190,6 +218,8 @@ class MainWindow(QMainWindow):
         widget.recording_started.connect(self._on_recording_started)
         widget.recording_stopped.connect(self._on_recording_stopped)
         widget.double_clicked.connect(self._toggle_fullscreen)
+        if self._detection_enabled and self._detector is not None:
+            widget.set_detector(self._detector)
         self.stream_widgets.append(widget)
         return widget
 
@@ -401,7 +431,86 @@ class MainWindow(QMainWindow):
             msg += f" | Recording: {recording}"
         self.statusBar().showMessage(msg)
 
+    def _toggle_detection(self):
+        """Enable or disable YOLOv9 detection on all streams."""
+        self._detection_enabled = not self._detection_enabled
+        if self._detection_enabled:
+            from app.yolov9_detector import YOLOv9Detector
+            self.statusBar().showMessage("Loading YOLOv9 model…")
+            try:
+                self._detector = YOLOv9Detector(
+                    self._model_path, self._conf_threshold, self._det_device
+                )
+            except Exception as exc:
+                QMessageBox.critical(self, "Detection Error", str(exc))
+                self._detection_enabled = False
+                self._det_toggle_action.setChecked(False)
+                self.statusBar().showMessage("Failed to load detection model")
+                return
+            for widget in self.stream_widgets:
+                widget.set_detector(self._detector)
+            self._det_btn.setText("Detection ON")
+            self.statusBar().showMessage("Detection enabled")
+        else:
+            for widget in self.stream_widgets:
+                widget.clear_detector()
+            self._detector = None
+            self._det_btn.setText("Detection OFF")
+            self.statusBar().showMessage("Detection disabled")
+        self._det_toggle_action.setChecked(self._detection_enabled)
+
+    def _load_model(self):
+        """Open a file dialog to select a YOLOv9 .pt or .onnx model file."""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select YOLOv9 Model", "", "Model Files (*.pt *.onnx);;All Files (*)"
+        )
+        if not path:
+            return
+        self._model_path = path
+        if self._detection_enabled:
+            # Reload with the new model file
+            for widget in self.stream_widgets:
+                widget.clear_detector()
+            self._detector = None
+            self._detection_enabled = False
+            self._toggle_detection()
+
+    def _show_detection_settings(self):
+        """Dialog to configure confidence threshold and inference device."""
+        conf, ok = QInputDialog.getDouble(
+            self,
+            "Detection Settings",
+            "Confidence threshold (0.01 – 0.99):",
+            self._conf_threshold,
+            0.01,
+            0.99,
+            2,
+        )
+        if not ok:
+            return
+        self._conf_threshold = conf
+
+        devices = ["auto", "cpu", "cuda", "cuda:0", "mps"]
+        current = "auto" if self._det_device is None else self._det_device
+        device, ok = QInputDialog.getItem(
+            self, "Detection Settings", "Inference device:", devices,
+            devices.index(current) if current in devices else 0, False
+        )
+        if not ok:
+            return
+        self._det_device = None if device == "auto" else device
+
+        if self._detection_enabled:
+            # Reload with updated settings
+            for widget in self.stream_widgets:
+                widget.clear_detector()
+            self._detector = None
+            self._detection_enabled = False
+            self._toggle_detection()
+
     def closeEvent(self, event):
         """Clean shutdown: stop all streams and recording."""
+        for widget in self.stream_widgets:
+            widget.clear_detector()
         self._stop_all_streams()
         event.accept()

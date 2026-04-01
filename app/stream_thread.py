@@ -1,3 +1,4 @@
+import os
 import time
 import cv2
 import numpy as np
@@ -11,10 +12,6 @@ class StreamThread(QThread):
     status_changed = pyqtSignal(str)  # "connecting", "connected", "disconnected", "error"
     error_occurred = pyqtSignal(str)
 
-    # Short timeout (in microseconds) so cap.open/read don't block for 30s
-    _OPEN_TIMEOUT_US = 5_000_000   # 5 seconds
-    _READ_TIMEOUT_US = 5_000_000   # 5 seconds
-
     def __init__(self, url, name="Stream", parent=None):
         # Do NOT parent to a widget — prevents "destroyed while running" when
         # the parent widget is deleted before the thread finishes.
@@ -24,21 +21,24 @@ class StreamThread(QThread):
         self._running = False
         self._reconnect_delay = 2  # seconds
 
+    def _open_capture(self):
+        """Open a VideoCapture with RTSP-over-TCP and short timeouts."""
+        # Force RTSP over TCP and set short timeouts via FFmpeg options
+        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
+            "rtsp_transport;tcp|stimeout;5000000"
+        )
+
+        cap = cv2.VideoCapture(self.url, cv2.CAP_FFMPEG)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        return cap
+
     def run(self):
         self._running = True
 
         while self._running:
             self.status_changed.emit("connecting")
 
-            cap = cv2.VideoCapture(
-                self.url,
-                cv2.CAP_FFMPEG,
-                [
-                    cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, self._OPEN_TIMEOUT_US // 1000,
-                    cv2.CAP_PROP_READ_TIMEOUT_MSEC, self._READ_TIMEOUT_US // 1000,
-                    cv2.CAP_PROP_BUFFERSIZE, 1,
-                ],
-            )
+            cap = self._open_capture()
 
             if not cap.isOpened():
                 self.status_changed.emit("error")
@@ -75,8 +75,7 @@ class StreamThread(QThread):
     def stop(self):
         """Signal the thread to stop and wait for it to finish."""
         self._running = False
-        # Wait long enough for the OpenCV timeout + some margin
+        # Wait long enough for the FFmpeg stimeout (5s) + margin
         if not self.wait(8000):
-            # Thread still running — force terminate as last resort
             self.terminate()
             self.wait(2000)

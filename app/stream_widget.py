@@ -11,9 +11,12 @@ from app.recorder import VideoRecorder
 class StreamWidget(QWidget):
     """Widget that displays a single RTSP video stream with recording support."""
 
-    recording_started = pyqtSignal(str)  # stream name
+    recording_started = pyqtSignal(str)   # stream name
     recording_stopped = pyqtSignal(str, str)  # stream name, filepath
-    double_clicked = pyqtSignal(object)  # self
+    double_clicked = pyqtSignal(object)   # self
+    thumbnail_ready = pyqtSignal(object)  # QPixmap — small sidebar preview
+    detection_changed = pyqtSignal(bool)  # True = detection active on this stream
+    detection_enable_requested = pyqtSignal(object)  # self — from context menu
 
     def __init__(self, stream_config, recording_dir="./recordings", parent=None):
         super().__init__(parent)
@@ -91,6 +94,7 @@ class StreamWidget(QWidget):
         self._detection_thread = DetectionThread(detector)
         self._detection_thread.detections_ready.connect(self._on_detections)
         self._detection_thread.start()
+        self.detection_changed.emit(True)
 
     def clear_detector(self):
         """Stop the detection thread and discard any cached results."""
@@ -101,6 +105,7 @@ class StreamWidget(QWidget):
                 pass
             self._detection_thread.stop()
             self._detection_thread = None
+            self.detection_changed.emit(False)
         self._last_detections = []
 
     def _on_detections(self, detections, fw, fh):
@@ -153,6 +158,14 @@ class StreamWidget(QWidget):
         h, w, ch = rgb.shape
         bytes_per_line = ch * w
         q_img = QImage(rgb.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
+
+        # Emit a small thumbnail for the sidebar (no overlays)
+        thumb = QPixmap.fromImage(q_img).scaled(
+            186, 105,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.FastTransformation,
+        )
+        self.thumbnail_ready.emit(thumb)
 
         # Scale to widget size — all streams display at the same cell size
         label_size = self.video_label.size()
@@ -271,7 +284,9 @@ class StreamWidget(QWidget):
             det_action.triggered.connect(self.clear_detector)
         else:
             det_action = QAction("Enable Detection", self)
-            det_action.setEnabled(False)  # must be enabled globally first
+            det_action.triggered.connect(
+                lambda: self.detection_enable_requested.emit(self)
+            )
         menu.addAction(det_action)
 
         menu.addSeparator()

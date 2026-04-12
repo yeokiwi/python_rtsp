@@ -3,6 +3,9 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QWidget,
     QGridLayout,
+    QHBoxLayout,
+    QVBoxLayout,
+    QScrollArea,
     QMenuBar,
     QMenu,
     QToolBar,
@@ -30,7 +33,6 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.config_manager = config_manager
         self.stream_widgets = []
-        self._fullscreen_widget = None
         self._grid_columns = config_manager.get_grid_columns()
 
         self._detector = None
@@ -38,6 +40,9 @@ class MainWindow(QMainWindow):
         self._model_path = "yolov9c.pt"
         self._conf_threshold = 0.25
         self._det_device = None  # auto-select
+
+        self._sidebar_items = {}   # StreamWidget → StreamSidebarItem
+        self._focused_widget = None
 
         self._setup_window()
         self._setup_menus()
@@ -190,9 +195,38 @@ class MainWindow(QMainWindow):
     def _setup_central_widget(self):
         self.central_widget = QWidget()
         self.setCentralWidget(self.central_widget)
-        self.grid_layout = QGridLayout(self.central_widget)
+
+        outer = QHBoxLayout(self.central_widget)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        # --- Left sidebar ---
+        self._sidebar_inner = QWidget()
+        self._sidebar_inner.setStyleSheet("background-color: #12122a;")
+        self._sidebar_vbox = QVBoxLayout(self._sidebar_inner)
+        self._sidebar_vbox.setContentsMargins(4, 4, 4, 4)
+        self._sidebar_vbox.setSpacing(4)
+        self._sidebar_vbox.addStretch()   # sidebar items inserted before this
+
+        self._sidebar_scroll = QScrollArea()
+        self._sidebar_scroll.setWidget(self._sidebar_inner)
+        self._sidebar_scroll.setWidgetResizable(True)
+        self._sidebar_scroll.setFixedWidth(210)
+        self._sidebar_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self._sidebar_scroll.setStyleSheet(
+            "QScrollArea { border: none; border-right: 1px solid #333; }"
+        )
+
+        # --- Main view area ---
+        self._view_area = QWidget()
+        self.grid_layout = QGridLayout(self._view_area)
         self.grid_layout.setSpacing(2)
         self.grid_layout.setContentsMargins(2, 2, 2, 2)
+
+        outer.addWidget(self._sidebar_scroll)
+        outer.addWidget(self._view_area, 1)
 
     def _setup_statusbar(self):
         self.statusBar().showMessage("Ready")
@@ -213,18 +247,37 @@ class MainWindow(QMainWindow):
             )
             return None
 
+        from app.sidebar_item import StreamSidebarItem
+
         rec_dir = self.config_manager.get_recording_directory()
         widget = StreamWidget(stream_config, recording_dir=rec_dir, parent=self)
         widget.recording_started.connect(self._on_recording_started)
         widget.recording_stopped.connect(self._on_recording_stopped)
-        widget.double_clicked.connect(self._toggle_fullscreen)
+        widget.double_clicked.connect(self._set_focused_stream)
+        widget.detection_enable_requested.connect(
+            lambda w: self._on_per_stream_detection_toggled(w, True)
+        )
         if self._detection_enabled and self._detector is not None:
             widget.set_detector(self._detector)
+
+        # Create a matching sidebar thumbnail item
+        item = StreamSidebarItem(widget)
+        item.stream_selected.connect(self._set_focused_stream)
+        item.detection_toggled.connect(self._on_per_stream_detection_toggled)
+        widget.thumbnail_ready.connect(item.update_thumbnail)
+        widget.detection_changed.connect(item.update_detection_state)
+        # Insert before the trailing stretch
+        self._sidebar_vbox.insertWidget(self._sidebar_vbox.count() - 1, item)
+        self._sidebar_items[widget] = item
+
         self.stream_widgets.append(widget)
         return widget
 
     def _rebuild_grid(self):
         """Rearrange all stream widgets in the grid layout."""
+        self._focused_widget = None
+        self._update_sidebar_selection(None)
+
         # Remove all widgets from grid without changing parent
         while self.grid_layout.count():
             item = self.grid_layout.takeAt(0)
@@ -317,6 +370,11 @@ class MainWindow(QMainWindow):
         )
         if reply == QMessageBox.StandardButton.Yes:
             widget = self.stream_widgets.pop(index)
+            # Remove sidebar item
+            sidebar_item = self._sidebar_items.pop(widget, None)
+            if sidebar_item is not None:
+                self._sidebar_vbox.removeWidget(sidebar_item)
+                sidebar_item.deleteLater()
             # Stop stream and disconnect signals before removing from layout
             widget.stop()
             self.grid_layout.removeWidget(widget)
@@ -357,21 +415,39 @@ class MainWindow(QMainWindow):
         self.config_manager.set_grid_columns(columns)
         self._rebuild_grid()
 
-    def _toggle_fullscreen(self, widget):
-        """Toggle a single stream to fill the entire grid or return to grid view."""
-        if self._fullscreen_widget is not None:
-            # Restore grid view
-            self._fullscreen_widget = None
+    def _set_focused_stream(self, widget):
+        """Expand a single stream to fill the main view, or return to grid."""
+        if self._focused_widget is widget:
+            # Clicking the same stream again → restore grid
             self._rebuild_grid()
-        else:
-            # Show only the clicked widget
-            self._fullscreen_widget = widget
-            while self.grid_layout.count():
-                item = self.grid_layout.takeAt(0)
-                if item.widget() and item.widget() != widget:
-                    item.widget().hide()
-            self.grid_layout.addWidget(widget, 0, 0)
-            widget.show()
+            return
+
+        self._focused_widget = widget
+
+        # Clear grid layout, hide all other streams
+        while self.grid_layout.count():
+            item = self.grid_layout.takeAt(0)
+            w = item.widget()
+            if w and w is not widget:
+                w.hide()
+
+        # Reset stretch factors then place the focused stream
+        for i in range(self.grid_layout.rowCount()):
+            self.grid_layout.setRowStretch(i, 0)
+        for i in range(self.grid_layout.columnCount()):
+            self.grid_layout.setColumnStretch(i, 0)
+
+        self.grid_layout.addWidget(widget, 0, 0)
+        self.grid_layout.setRowStretch(0, 1)
+        self.grid_layout.setColumnStretch(0, 1)
+        widget.show()
+
+        self._update_sidebar_selection(widget)
+
+    def _update_sidebar_selection(self, focused_widget):
+        """Highlight the sidebar item whose stream is currently focused."""
+        for sw, item in self._sidebar_items.items():
+            item.set_selected(sw is focused_widget)
 
     def _show_settings(self):
         dialog = SettingsDialog(
@@ -390,7 +466,13 @@ class MainWindow(QMainWindow):
         """Reload configuration from file and refresh all streams."""
         self._stop_all_streams()
 
-        # Clear existing widgets
+        # Clear sidebar items
+        for item in self._sidebar_items.values():
+            self._sidebar_vbox.removeWidget(item)
+            item.deleteLater()
+        self._sidebar_items.clear()
+
+        # Clear existing stream widgets
         for widget in self.stream_widgets:
             widget.stop()
             widget.deleteLater()
@@ -430,6 +512,30 @@ class MainWindow(QMainWindow):
         if recording:
             msg += f" | Recording: {recording}"
         self.statusBar().showMessage(msg)
+
+    def _on_per_stream_detection_toggled(self, widget, enable):
+        """Enable or disable detection for a single stream."""
+        if enable:
+            if self._detector is None:
+                from app.yolov9_detector import YOLOv9Detector
+                self.statusBar().showMessage("Loading YOLOv9 model…")
+                try:
+                    self._detector = YOLOv9Detector(
+                        self._model_path, self._conf_threshold, self._det_device
+                    )
+                except Exception as exc:
+                    QMessageBox.critical(self, "Detection Error", str(exc))
+                    self.statusBar().showMessage("Failed to load detection model")
+                    # Revert the sidebar DET button state
+                    item = self._sidebar_items.get(widget)
+                    if item:
+                        item.update_detection_state(False)
+                    return
+            widget.set_detector(self._detector)
+            self.statusBar().showMessage(f"Detection enabled: {widget.name}")
+        else:
+            widget.clear_detector()
+            self.statusBar().showMessage(f"Detection disabled: {widget.name}")
 
     def _toggle_detection(self):
         """Enable or disable YOLOv9 detection on all streams."""

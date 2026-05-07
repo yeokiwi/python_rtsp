@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Local artifacts
+recordings/
+snapshots/
+*.pt
+*.onnx
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store

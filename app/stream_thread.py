@@ -1,29 +1,32 @@
 import os
-import time
+import threading
 import cv2
 import numpy as np
-from PyQt6.QtCore import QThread, pyqtSignal
+from PyQt6.QtCore import QObject, pyqtSignal
 
 
-class StreamThread(QThread):
-    """Worker thread that captures frames from an RTSP stream."""
+class StreamWorker(QObject):
+    """Worker that captures frames from an RTSP stream.
+
+    Runs on a thread owned by a shared ThreadPoolExecutor; emits Qt signals
+    that are delivered to GUI-thread receivers via queued connections.
+    """
 
     frame_received = pyqtSignal(np.ndarray)
     status_changed = pyqtSignal(str)  # "connecting", "connected", "disconnected", "error"
     error_occurred = pyqtSignal(str)
 
     def __init__(self, url, name="Stream", parent=None):
-        # Do NOT parent to a widget — prevents "destroyed while running" when
-        # the parent widget is deleted before the thread finishes.
-        super().__init__(None)
+        super().__init__(parent)
         self.url = url
         self.name = name
         self._running = False
+        self._stop_event = threading.Event()
         self._reconnect_delay = 2  # seconds
+        self._cap_fps = 0.0
 
     def _open_capture(self):
         """Open a VideoCapture with RTSP-over-TCP and short timeouts."""
-        # Force RTSP over TCP and set short timeouts via FFmpeg options
         os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
             "rtsp_transport;tcp|stimeout;5000000"
         )
@@ -33,7 +36,9 @@ class StreamThread(QThread):
         return cap
 
     def run(self):
+        """Run the capture loop. Submitted to the shared thread pool."""
         self._running = True
+        self._stop_event.clear()
 
         while self._running:
             self.status_changed.emit("connecting")
@@ -43,10 +48,15 @@ class StreamThread(QThread):
             if not cap.isOpened():
                 self.status_changed.emit("error")
                 self.error_occurred.emit(f"Cannot connect to {self.name}")
-                if self._running:
+                if self._running and not self._stop_event.is_set():
                     self._wait_reconnect()
                     continue
                 break
+
+            try:
+                self._cap_fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
+            except Exception:
+                self._cap_fps = 0.0
 
             self.status_changed.emit("connected")
 
@@ -66,16 +76,10 @@ class StreamThread(QThread):
         self.status_changed.emit("disconnected")
 
     def _wait_reconnect(self):
-        """Wait before attempting reconnection."""
-        delay = self._reconnect_delay
-        end_time = time.time() + delay
-        while self._running and time.time() < end_time:
-            time.sleep(0.1)
+        """Wait before attempting reconnection (interruptible by stop)."""
+        self._stop_event.wait(self._reconnect_delay)
 
     def stop(self):
-        """Signal the thread to stop and wait for it to finish."""
+        """Signal the worker to exit. Non-blocking; the future tracks completion."""
         self._running = False
-        # Wait long enough for the FFmpeg stimeout (5s) + margin
-        if not self.wait(8000):
-            self.terminate()
-            self.wait(2000)
+        self._stop_event.set()

@@ -14,8 +14,9 @@ class StreamSidebarItem(QWidget):
     THUMB_W = 186
     THUMB_H = 105  # ~16:9
 
-    stream_selected   = pyqtSignal(object)        # StreamWidget ref
-    detection_toggled = pyqtSignal(object, bool)  # StreamWidget ref, enable
+    stream_selected    = pyqtSignal(object)        # StreamWidget ref
+    detection_toggled  = pyqtSignal(object, bool)  # StreamWidget ref, enable
+    connection_toggled = pyqtSignal(object, bool)  # StreamWidget ref, connect
 
     def __init__(self, stream_widget, parent=None):
         super().__init__(parent)
@@ -55,9 +56,16 @@ class StreamSidebarItem(QWidget):
 
         self._name_label = QLabel(self._stream_widget.name)
         self._name_label.setStyleSheet("color: #cccccc; font-size: 10px;")
-        self._name_label.setMaximumWidth(130)
+        self._name_label.setMaximumWidth(90)
         self._name_label.setWordWrap(False)
         self._name_label.setTextFormat(Qt.TextFormat.PlainText)
+
+        self._conn_btn = QPushButton("CONN")
+        self._conn_btn.setCheckable(True)
+        self._conn_btn.setFixedSize(44, 20)
+        self._conn_btn.setStyleSheet(self._conn_btn_style(False))
+        self._conn_btn.setEnabled(self._stream_widget.enabled)
+        self._conn_btn.toggled.connect(self._on_conn_toggled)
 
         self._det_btn = QPushButton("DET")
         self._det_btn.setCheckable(True)
@@ -66,8 +74,27 @@ class StreamSidebarItem(QWidget):
         self._det_btn.toggled.connect(self._on_det_toggled)
 
         bar_layout.addWidget(self._name_label, 1)
+        bar_layout.addWidget(self._conn_btn)
         bar_layout.addWidget(self._det_btn)
         layout.addWidget(bar)
+
+    @staticmethod
+    def _conn_btn_style(active: bool) -> str:
+        if active:
+            return (
+                "QPushButton { background-color: #1a4a8a; color: #cce0ff;"
+                " border: 1px solid #2a6ad0; border-radius: 3px; font-size: 9px; font-weight: bold; }"
+                " QPushButton:hover { background-color: #225faa; }"
+                " QPushButton:disabled { background-color: #1a1a2a; color: #555;"
+                " border: 1px solid #2a2a3a; }"
+            )
+        return (
+            "QPushButton { background-color: #2a2a3a; color: #888;"
+            " border: 1px solid #3a3a5a; border-radius: 3px; font-size: 9px; }"
+            " QPushButton:hover { background-color: #3a3a4a; color: #aaa; }"
+            " QPushButton:disabled { background-color: #1a1a2a; color: #555;"
+            " border: 1px solid #2a2a3a; }"
+        )
 
     @staticmethod
     def _det_btn_style(active: bool) -> str:
@@ -86,6 +113,10 @@ class StreamSidebarItem(QWidget):
     def _on_det_toggled(self, checked: bool):
         self._det_btn.setStyleSheet(self._det_btn_style(checked))
         self.detection_toggled.emit(self._stream_widget, checked)
+
+    def _on_conn_toggled(self, checked: bool):
+        self._conn_btn.setStyleSheet(self._conn_btn_style(checked))
+        self.connection_toggled.emit(self._stream_widget, checked)
 
     # ------------------------------------------------------------------
     # Public API called by MainWindow
@@ -106,6 +137,17 @@ class StreamSidebarItem(QWidget):
         self._det_btn.setChecked(active)
         self._det_btn.setStyleSheet(self._det_btn_style(active))
         self._det_btn.blockSignals(False)
+
+    def update_connection_state(self, active: bool):
+        """Sync the CONN button state without triggering the toggled signal."""
+        self._conn_btn.blockSignals(True)
+        self._conn_btn.setChecked(active)
+        self._conn_btn.setStyleSheet(self._conn_btn_style(active))
+        self._conn_btn.blockSignals(False)
+
+    def update_enabled_state(self, enabled: bool):
+        """Reflect the underlying stream's enabled flag on the CONN button."""
+        self._conn_btn.setEnabled(enabled)
 
     def set_selected(self, selected: bool):
         """Highlight this item when its stream is focused in the main view."""
@@ -129,10 +171,14 @@ class StreamSidebarItem(QWidget):
     # ------------------------------------------------------------------
 
     def mousePressEvent(self, event):
-        # Only emit focus signal if the click is NOT on the DET button.
-        # Map the event position from this widget's coordinate space into
-        # the DET button's own coordinate space before checking containment.
-        pos_in_btn = self._det_btn.mapFrom(self, event.pos())
-        if not self._det_btn.rect().contains(pos_in_btn):
+        # Only emit the focus signal if the click is NOT on the CONN or DET button.
+        # Map the event position into each button's own coordinate space first.
+        on_det = self._det_btn.rect().contains(
+            self._det_btn.mapFrom(self, event.pos())
+        )
+        on_conn = self._conn_btn.rect().contains(
+            self._conn_btn.mapFrom(self, event.pos())
+        )
+        if not (on_det or on_conn):
             self.stream_selected.emit(self._stream_widget)
         super().mousePressEvent(event)

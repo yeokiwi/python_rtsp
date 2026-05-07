@@ -21,6 +21,7 @@ from PyQt6.QtCore import Qt
 
 from app.config_manager import ConfigManager
 from app.stream_widget import StreamWidget
+from app.stream_pool import StreamPool
 from app.dialogs import StreamDialog, SettingsDialog
 
 
@@ -43,6 +44,9 @@ class MainWindow(QMainWindow):
 
         self._sidebar_items = {}   # StreamWidget → StreamSidebarItem
         self._focused_widget = None
+
+        # Single shared executor for all RTSP capture workers.
+        self._stream_pool = StreamPool(max_workers=self.MAX_STREAMS)
 
         self._setup_window()
         self._setup_menus()
@@ -232,12 +236,11 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Ready")
 
     def _load_streams(self):
-        """Load streams from config and create widgets."""
+        """Load streams from config and create widgets (without connecting)."""
         streams = self.config_manager.get_streams()
         for stream_config in streams:
             self._create_stream_widget(stream_config)
         self._rebuild_grid()
-        self._start_all_streams()
 
     def _create_stream_widget(self, stream_config):
         """Create a stream widget and add it to the list."""
@@ -251,6 +254,7 @@ class MainWindow(QMainWindow):
 
         rec_dir = self.config_manager.get_recording_directory()
         widget = StreamWidget(stream_config, recording_dir=rec_dir, parent=self)
+        widget.set_pool(self._stream_pool)
         widget.recording_started.connect(self._on_recording_started)
         widget.recording_stopped.connect(self._on_recording_stopped)
         widget.double_clicked.connect(self._set_focused_stream)
@@ -264,8 +268,11 @@ class MainWindow(QMainWindow):
         item = StreamSidebarItem(widget)
         item.stream_selected.connect(self._set_focused_stream)
         item.detection_toggled.connect(self._on_per_stream_detection_toggled)
+        item.connection_toggled.connect(self._on_per_stream_connection_toggled)
         widget.thumbnail_ready.connect(item.update_thumbnail)
         widget.detection_changed.connect(item.update_detection_state)
+        widget.connection_changed.connect(item.update_connection_state)
+        widget.connection_changed.connect(lambda _: self._update_status())
         # Insert before the trailing stretch
         self._sidebar_vbox.insertWidget(self._sidebar_vbox.count() - 1, item)
         self._sidebar_items[widget] = item
@@ -323,7 +330,6 @@ class MainWindow(QMainWindow):
             widget = self._create_stream_widget(data)
             if widget:
                 self._rebuild_grid()
-                widget.start()
 
     def _edit_stream(self):
         if not self.stream_widgets:
@@ -349,6 +355,9 @@ class MainWindow(QMainWindow):
             data = dialog.get_data()
             self.config_manager.update_stream(index, data["name"], data["url"], data["enabled"])
             widget.update_config(data)
+            sidebar_item = self._sidebar_items.get(widget)
+            if sidebar_item is not None:
+                sidebar_item.update_enabled_state(widget.enabled)
             self._update_status()
 
     def _remove_stream(self):
@@ -386,12 +395,14 @@ class MainWindow(QMainWindow):
 
     def _start_all_streams(self):
         for widget in self.stream_widgets:
-            widget.start()
+            if widget.enabled and not widget.is_connected():
+                widget.start()
         self._update_status()
 
     def _stop_all_streams(self):
         for widget in self.stream_widgets:
-            widget.stop()
+            if widget.is_connected():
+                widget.stop()
         self._update_status()
 
     def _start_all_recording(self):
@@ -513,6 +524,22 @@ class MainWindow(QMainWindow):
             msg += f" | Recording: {recording}"
         self.statusBar().showMessage(msg)
 
+    def _on_per_stream_connection_toggled(self, widget, connect):
+        """Connect or disconnect a single stream from the sidebar CONN button."""
+        if connect:
+            if not widget.enabled:
+                # Defensive: button should be disabled, but bail out cleanly anyway.
+                item = self._sidebar_items.get(widget)
+                if item is not None:
+                    item.update_connection_state(False)
+                return
+            widget.start()
+            self.statusBar().showMessage(f"Connecting: {widget.name}")
+        else:
+            widget.stop()
+            self.statusBar().showMessage(f"Disconnected: {widget.name}")
+        self._update_status()
+
     def _on_per_stream_detection_toggled(self, widget, enable):
         """Enable or disable detection for a single stream."""
         if enable:
@@ -615,8 +642,20 @@ class MainWindow(QMainWindow):
             self._toggle_detection()
 
     def closeEvent(self, event):
-        """Clean shutdown: stop all streams and recording."""
+        """Clean shutdown: stop all streams, drain pool, then exit."""
+        from concurrent.futures import wait as futures_wait
+
+        futures = []
         for widget in self.stream_widgets:
             widget.clear_detector()
+            future = widget._future
+            if future is not None:
+                futures.append(future)
         self._stop_all_streams()
+
+        # Give workers up to ~8s to unwind FFmpeg's 5s stimeout.
+        if futures:
+            futures_wait(futures, timeout=8)
+
+        self._stream_pool.shutdown(wait=True)
         event.accept()

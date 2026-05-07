@@ -4,7 +4,7 @@ from PyQt6.QtWidgets import QWidget, QLabel, QVBoxLayout, QMenu
 from PyQt6.QtGui import QImage, QPixmap, QAction, QPainter, QColor, QFont
 from PyQt6.QtCore import Qt, pyqtSignal
 
-from app.stream_thread import StreamThread
+from app.stream_thread import StreamWorker
 from app.recorder import VideoRecorder
 
 
@@ -17,6 +17,7 @@ class StreamWidget(QWidget):
     thumbnail_ready = pyqtSignal(object)  # QPixmap — small sidebar preview
     detection_changed = pyqtSignal(bool)  # True = detection active on this stream
     detection_enable_requested = pyqtSignal(object)  # self — from context menu
+    connection_changed = pyqtSignal(bool)  # True = user-requested connect is active
 
     def __init__(self, stream_config, recording_dir="./recordings", parent=None):
         super().__init__(parent)
@@ -27,7 +28,9 @@ class StreamWidget(QWidget):
 
         self._status = "idle"
         self._last_frame = None
-        self._thread = None
+        self._worker = None
+        self._future = None
+        self._pool = None
         self._recorder = VideoRecorder(recording_dir)
         self._frame_size = None
         self._fps = 20.0
@@ -72,20 +75,32 @@ class StreamWidget(QWidget):
             "border: none; color: #aaaaaa; font-size: 14px; padding: 10px;"
         )
 
+    def set_pool(self, pool):
+        """Inject the shared StreamPool used to run the capture worker."""
+        self._pool = pool
+
     def start(self):
-        """Start receiving the RTSP stream."""
+        """Connect the RTSP stream by submitting a worker to the shared pool."""
         if not self.enabled:
             self._status = "disabled"
             self._update_placeholder()
             return
 
-        if self._thread is not None:
-            self.stop()
+        if self._worker is not None:
+            return
 
-        self._thread = StreamThread(self.url, self.name)
-        self._thread.frame_received.connect(self._on_frame)
-        self._thread.status_changed.connect(self._on_status_changed)
-        self._thread.start()
+        if self._pool is None:
+            raise RuntimeError(
+                f"StreamWidget '{self.name}' has no pool; call set_pool() first."
+            )
+
+        self._worker = StreamWorker(self.url, self.name)
+        self._worker.frame_received.connect(self._on_frame)
+        self._worker.status_changed.connect(self._on_status_changed)
+        self._status = "connecting"
+        self._update_placeholder()
+        self._future = self._pool.submit(self._worker.run)
+        self.connection_changed.emit(True)
 
     def set_detector(self, detector):
         """Attach a YOLOv9Detector and start the per-stream detection thread."""
@@ -115,25 +130,36 @@ class StreamWidget(QWidget):
         self._det_frame_h = fh
 
     def stop(self):
-        """Stop the stream and any active recording."""
+        """Disconnect the stream and any active recording.
+
+        Non-blocking: signals the worker to exit; the future tracks completion.
+        """
         self.clear_detector()
 
         if self._recorder.is_recording:
             self.stop_recording()
 
-        if self._thread is not None:
+        was_active = self._worker is not None
+        if self._worker is not None:
             # Disconnect signals first to prevent callbacks on a stopping/deleted widget
             try:
-                self._thread.frame_received.disconnect(self._on_frame)
-                self._thread.status_changed.disconnect(self._on_status_changed)
+                self._worker.frame_received.disconnect(self._on_frame)
+                self._worker.status_changed.disconnect(self._on_status_changed)
             except (TypeError, RuntimeError):
                 pass
-            self._thread.stop()
-            self._thread = None
+            self._worker.stop()
+            self._worker = None
+            self._future = None
 
         self._last_frame = None
         self._status = "idle"
         self._update_placeholder()
+        if was_active:
+            self.connection_changed.emit(False)
+
+    def is_connected(self):
+        """Whether the user has requested a connection (worker is active)."""
+        return self._worker is not None
 
     def _on_frame(self, frame):
         """Handle a new frame from the stream thread."""
@@ -142,8 +168,8 @@ class StreamWidget(QWidget):
         self._frame_size = (w, h)
 
         # Estimate FPS from capture if possible
-        if self._thread and hasattr(self._thread, "_cap_fps"):
-            self._fps = self._thread._cap_fps or 20.0
+        if self._worker and getattr(self._worker, "_cap_fps", 0):
+            self._fps = self._worker._cap_fps or 20.0
 
         # Submit to detection thread if active (non-blocking; drops if busy)
         if self._detection_thread is not None:
@@ -264,6 +290,16 @@ class StreamWidget(QWidget):
     def _show_context_menu(self, pos):
         menu = QMenu(self)
 
+        if self._worker is None:
+            conn_action = QAction("Connect", self)
+            conn_action.setEnabled(self.enabled)
+            conn_action.triggered.connect(self.start)
+        else:
+            conn_action = QAction("Disconnect", self)
+            conn_action.triggered.connect(self.stop)
+        menu.addAction(conn_action)
+        menu.addSeparator()
+
         if self._recorder.is_recording:
             stop_rec = QAction("Stop Recording", self)
             stop_rec.triggered.connect(self.stop_recording)
@@ -301,16 +337,18 @@ class StreamWidget(QWidget):
         self.double_clicked.emit(self)
 
     def update_config(self, stream_config):
-        """Update the stream configuration. Restarts if URL changed."""
+        """Update the stream configuration. Reconnects only if it was already connected."""
         old_url = self.url
         self.stream_config = stream_config
         self.name = stream_config.get("name", "Unknown")
         self.url = stream_config.get("url", "")
         self.enabled = stream_config.get("enabled", True)
 
+        was_connected = self._worker is not None
         if self.url != old_url:
             self.stop()
-            self.start()
+            if was_connected and self.enabled:
+                self.start()
         elif not self.enabled:
             self.stop()
             self._status = "disabled"
